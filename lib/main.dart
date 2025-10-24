@@ -2,7 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'package:intl/intl.dart';
 import 'package:firebase_core/firebase_core.dart';
-import 'package:firebase_database/firebase_database.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
 import 'firebase_options.dart';
 import 'package:flutter/foundation.dart' show kIsWeb;
 
@@ -10,7 +10,7 @@ import 'package:flutter/foundation.dart' show kIsWeb;
 // GoogleService-Info.plist for iOS) as instructed in the README section below.
 
 // Simple Event Manager single-file Flutter app
-// Dependencies: provider: ^6.0.0
+// Dependencies: provider: ^6.0.0, cloud_firestore: ^5.0.0
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -39,9 +39,9 @@ class MyApp extends StatelessWidget {
           useMaterial3: true,
         ),
         home: const MainScreen(),
-        // tiny demo route for Firebase Realtime Database
+        // tiny demo route for Firestore
         routes: {
-          '/firebase_demo': (_) => const FirebaseDemoScreen(),
+          '/firestore_demo': (_) => const FirestoreDemoScreen(),
         },
       ),
     );
@@ -66,131 +66,117 @@ class EventItem {
 // ---------- Provider / State Management ----------
 class EventProvider extends ChangeNotifier {
   final List<EventItem> _events = [];
-  late final DatabaseReference _eventsRef;
+  late final CollectionReference _eventsCollection;
+  bool _initialized = false;
 
   EventProvider() {
-    // initialize DB reference and listeners
+    // initialize Firestore reference and listeners
     try {
-      _eventsRef = FirebaseDatabase.instance.ref('events');
-      // initial load: listen for child added/changed/removed
-      _eventsRef.onChildAdded.listen((ev) {
-        final snapshotValue = ev.snapshot.value;
-        if (snapshotValue == null) return;
-        final map = Map<String, dynamic>.from(snapshotValue as Map);
-        final item = _fromMap(map);
-        // avoid duplicates
-        if (_events.indexWhere((e) => e.id == item.id) == -1) {
-          _events.add(item);
-          notifyListeners();
+      _eventsCollection = FirebaseFirestore.instance.collection('events');
+      // Listen to real-time updates
+      _eventsCollection.snapshots().listen((snapshot) {
+        _events.clear();
+        for (var doc in snapshot.docs) {
+          try {
+            final item = _fromFirestore(doc);
+            _events.add(item);
+          } catch (e) {
+            // Skip invalid documents
+            print('Error parsing document ${doc.id}: $e');
+          }
         }
-      });
-
-      _eventsRef.onChildChanged.listen((ev) {
-        final snapshotValue = ev.snapshot.value;
-        if (snapshotValue == null) return;
-        final map = Map<String, dynamic>.from(snapshotValue as Map);
-        final item = _fromMap(map);
-        final idx = _events.indexWhere((e) => e.id == item.id);
-        if (idx >= 0) {
-          _events[idx] = item;
-          notifyListeners();
-        }
-      });
-
-      _eventsRef.onChildRemoved.listen((ev) {
-        final id = ev.snapshot.key;
-        if (id == null) return;
-        _events.removeWhere((e) => e.id == id);
+        _initialized = true;
         notifyListeners();
       });
     } catch (err) {
-      // If Firebase not initialized or DB not available, fallback to local-only behavior.
+      // If Firebase not initialized or Firestore not available, fallback to local-only behavior.
+      print('Firestore initialization error: $err');
     }
   }
 
   List<EventItem> get events => List.unmodifiable(_events);
 
-  void addEvent(EventItem e) {
+  Future<void> addEvent(EventItem e) async {
     _events.add(e);
     notifyListeners();
     try {
-      _eventsRef.child(e.id).set(_toMap(e));
+      await _eventsCollection.doc(e.id).set(_toFirestore(e));
     } catch (err) {
-      // ignore write errors locally
+      print('Error adding event: $err');
+      // Remove from local list if Firestore write fails
+      _events.removeWhere((event) => event.id == e.id);
+      notifyListeners();
     }
   }
 
-  void updateEvent(String id, EventItem newEvent) {
+  Future<void> updateEvent(String id, EventItem newEvent) async {
     final idx = _events.indexWhere((it) => it.id == id);
     if (idx >= 0) {
+      final oldEvent = _events[idx];
       _events[idx] = newEvent;
       notifyListeners();
       try {
-        _eventsRef.child(id).set(_toMap(newEvent));
+        await _eventsCollection.doc(id).update(_toFirestore(newEvent));
       } catch (err) {
-        // ignore
+        print('Error updating event: $err');
+        // Revert on error
+        _events[idx] = oldEvent;
+        notifyListeners();
       }
     }
   }
 
-  void deleteEvent(String id) {
-    _events.removeWhere((it) => it.id == id);
-    notifyListeners();
-    try {
-      _eventsRef.child(id).remove();
-    } catch (err) {
-      // ignore
+  Future<void> deleteEvent(String id) async {
+    final idx = _events.indexWhere((it) => it.id == id);
+    if (idx >= 0) {
+      final removedEvent = _events[idx];
+      _events.removeWhere((it) => it.id == id);
+      notifyListeners();
+      try {
+        await _eventsCollection.doc(id).delete();
+      } catch (err) {
+        print('Error deleting event: $err');
+        // Restore on error
+        _events.insert(idx, removedEvent);
+        notifyListeners();
+      }
     }
   }
 
-  // Helper: convert EventItem -> Map for JSON
-  Map<String, Object> _toMap(EventItem e) {
+  // Helper: convert EventItem -> Map for Firestore
+  Map<String, Object> _toFirestore(EventItem e) {
     return {
       'id': e.id,
       'name': e.name,
       'venue': e.venue,
-      'dateTime': e.dateTime.toUtc().toIso8601String(),
+      'dateTime': Timestamp.fromDate(e.dateTime.toUtc()),
     };
   }
 
-  // Helper: construct EventItem from DB map
-  EventItem _fromMap(Map map) {
-    final id =
-        map['id']?.toString() ?? (map['key']?.toString() ?? evKeyFromMap(map));
-    // Accept multiple possible name keys (eventname, name)
+  // Helper: construct EventItem from Firestore document
+  EventItem _fromFirestore(DocumentSnapshot doc) {
+    final data = doc.data() as Map<String, dynamic>;
+    final id = doc.id;
+
+    // Accept multiple possible name keys
     final name =
-        (map['name'] ?? map['eventname'] ?? map['eventName'])?.toString() ?? '';
-    final venue = (map['venue'] ?? map['location'])?.toString() ?? '';
+        (data['name'] ?? data['eventname'] ?? data['eventName'])?.toString() ??
+            '';
+    final venue = (data['venue'] ?? data['location'])?.toString() ?? '';
 
     final dynamic dateField =
-        map['dateTime'] ?? map['date'] ?? map['timestamp'];
+        data['dateTime'] ?? data['date'] ?? data['timestamp'];
     final DateTime dt = _parseDynamicDate(dateField);
-    return EventItem(id: id, name: name, venue: venue, dateTime: dt);
-  }
 
-  // Try to recover an event key if it's provided as the DB snapshot key inside the map.
-  String evKeyFromMap(Map map) {
-    if (map.containsKey(r'$key')) return map[r'$key']?.toString() ?? '';
-    if (map.containsKey('key')) return map['key']?.toString() ?? '';
-    return '';
+    return EventItem(id: id, name: name, venue: venue, dateTime: dt);
   }
 
   DateTime _parseDynamicDate(dynamic v) {
     if (v == null) return DateTime.now();
 
-    // If Firebase server timestamp comes as a map with seconds/nanos
-    if (v is Map) {
-      // common shapes: {'_seconds':..., '_nanoseconds':...} or {'seconds':..., 'nanoseconds':...}
-      final seconds = v['_seconds'] ?? v['seconds'];
-      final nanos = v['_nanoseconds'] ?? v['nanoseconds'] ?? 0;
-      if (seconds is int || seconds is double) {
-        final ms =
-            ((seconds is int ? seconds : (seconds as double).toInt()) * 1000) +
-                (nanos ~/ 1000000);
-        return DateTime.fromMillisecondsSinceEpoch(ms.toInt()).toLocal();
-      }
-      // fallback
-      return DateTime.now();
+    // Firestore Timestamp
+    if (v is Timestamp) {
+      return v.toDate().toLocal();
     }
 
     // If it's numeric (seconds or milliseconds)
@@ -202,51 +188,28 @@ class EventProvider extends ChangeNotifier {
         return DateTime.fromMillisecondsSinceEpoch(v * 1000).toLocal();
       }
     }
+
     if (v is double) {
       final iv = v.toInt();
-      if (iv > 1000000000000)
+      if (iv > 1000000000000) {
         return DateTime.fromMillisecondsSinceEpoch(iv).toLocal();
+      }
       return DateTime.fromMillisecondsSinceEpoch(iv * 1000).toLocal();
     }
 
-    // If it's a String, try several parsing strategies
+    // If it's a String, try parsing
     if (v is String) {
-      // 1) ISO-8601
       try {
         final p = DateTime.parse(v);
         return p.toLocal();
-      } catch (_) {}
-
-      // 2) Firebase Console human format with 'UTC+offset' like:
-      //    "October 23, 2025 at 3:40:11 PM UTC+5:30"
-      final utcIndex = v.indexOf(' UTC');
-      if (utcIndex != -1) {
-        final left = v.substring(0, utcIndex).trim();
-        final right = v.substring(utcIndex + 4).trim(); // e.g. +5:30
+      } catch (_) {
+        // Try common date format
         try {
           final df = DateFormat("MMMM d, yyyy 'at' h:mm:ss a");
-          final localNoOffset = df.parseLoose(left);
-          // parse offset
-          final m = RegExp(r"([+-])(\d{1,2}):(\d{2})").firstMatch(right);
-          if (m != null) {
-            final sign = m.group(1) == '-' ? -1 : 1;
-            final hours = int.parse(m.group(2)!);
-            final mins = int.parse(m.group(3)!);
-            final offset = Duration(hours: hours, minutes: mins) * sign;
-            // localNoOffset is the wall time at that offset; convert to UTC by subtracting offset
-            final utc = localNoOffset.subtract(offset);
-            return utc.toLocal();
-          }
-          return localNoOffset.toLocal();
+          final parsed = df.parseLoose(v);
+          return parsed.toLocal();
         } catch (_) {}
       }
-
-      // 3) Try a common readable pattern without UTC
-      try {
-        final df2 = DateFormat("MMMM d, yyyy 'at' h:mm:ss a");
-        final parsed = df2.parseLoose(v);
-        return parsed.toLocal();
-      } catch (_) {}
     }
 
     // Fallback
@@ -374,57 +337,65 @@ class _MainScreenState extends State<MainScreen> {
   }
 }
 
-// ---------------- Firebase demo ----------------
-class FirebaseDemoScreen extends StatefulWidget {
-  const FirebaseDemoScreen({super.key});
+// ---------------- Firestore demo ----------------
+class FirestoreDemoScreen extends StatefulWidget {
+  const FirestoreDemoScreen({super.key});
 
   @override
-  State<FirebaseDemoScreen> createState() => _FirebaseDemoScreenState();
+  State<FirestoreDemoScreen> createState() => _FirestoreDemoScreenState();
 }
 
-class _FirebaseDemoScreenState extends State<FirebaseDemoScreen> {
-  late DatabaseReference _counterRef;
+class _FirestoreDemoScreenState extends State<FirestoreDemoScreen> {
+  late DocumentReference _counterDoc;
   int _counter = 0;
   bool _initialized = false;
 
   @override
   void initState() {
     super.initState();
-    _initFirebase();
+    _initFirestore();
   }
 
-  Future<void> _initFirebase() async {
+  Future<void> _initFirestore() async {
     try {
       await Firebase.initializeApp();
-      final db = FirebaseDatabase.instance;
-      _counterRef = db.ref('demo/counter');
+      final db = FirebaseFirestore.instance;
+      _counterDoc = db.collection('demo').doc('counter');
 
       // listen for changes
-      _counterRef.onValue.listen((e) {
-        final val = e.snapshot.value;
-        setState(() {
-          _counter = (val is int) ? val : int.tryParse('$val') ?? 0;
-          _initialized = true;
-        });
+      _counterDoc.snapshots().listen((snapshot) {
+        if (snapshot.exists) {
+          final data = snapshot.data() as Map<String, dynamic>?;
+          final val = data?['value'];
+          setState(() {
+            _counter = (val is int) ? val : int.tryParse('$val') ?? 0;
+            _initialized = true;
+          });
+        } else {
+          setState(() {
+            _counter = 0;
+            _initialized = true;
+          });
+        }
       });
     } catch (err) {
-      // ignore for now; show in UI
+      print('Firestore init error: $err');
       setState(() => _initialized = true);
     }
   }
 
   Future<void> _increment() async {
-    await _counterRef.set(_counter + 1);
+    await _counterDoc.set({'value': _counter + 1});
   }
 
   Future<void> _reset() async {
-    await _counterRef.set(0);
+    await _counterDoc.set({'value': 0});
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('Firebase Realtime DB Demo')),
+      appBar: AppBar(title: const Text('Firestore Demo')),
       body: Center(
         child: _initialized
             ? Column(
@@ -502,7 +473,7 @@ class EventCard extends StatelessWidget {
                   ),
                 );
                 if (ok == true) {
-                  Provider.of<EventProvider>(context, listen: false)
+                  await Provider.of<EventProvider>(context, listen: false)
                       .deleteEvent(event.id);
                 }
               }
@@ -594,7 +565,7 @@ class EventDetailsScreen extends StatelessWidget {
                       ),
                     );
                     if (ok == true) {
-                      Provider.of<EventProvider>(context, listen: false)
+                      await Provider.of<EventProvider>(context, listen: false)
                           .deleteEvent(event.id);
                       Navigator.of(context).pop();
                     }
@@ -738,9 +709,9 @@ class _AddEditEventScreenState extends State<AddEditEventScreen> {
     if (confirmed != true) return;
 
     if (widget.event == null) {
-      provider.addEvent(newEvent);
+      await provider.addEvent(newEvent);
     } else {
-      provider.updateEvent(widget.event!.id, newEvent);
+      await provider.updateEvent(widget.event!.id, newEvent);
     }
 
     Navigator.of(context).pop();

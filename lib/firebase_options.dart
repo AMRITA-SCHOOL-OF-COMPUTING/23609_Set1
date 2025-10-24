@@ -57,6 +57,7 @@ class DefaultFirebaseOptions {
     messagingSenderId: '860993950777',
     projectId: 'geminidemo-8a0f0',
     authDomain: 'geminidemo-8a0f0.firebaseapp.com',
+    databaseURL: 'https://geminidemo-8a0f0-default-rtdb.firebaseio.com',
     storageBucket: 'geminidemo-8a0f0.firebasestorage.app',
     measurementId: 'G-JMJ5MKS0Z8',
   );
